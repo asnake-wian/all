@@ -367,4 +367,9 @@ while ($true) {
 
             if ($t -match '^/UninstallRust\b') { Send-Tg $cid ("UninstallRust -> " + (Run-PS $ScriptUninstallRust)); continue }
             if ($t -match '^/UninstallOld\b') { Run-PS $ScriptUninstallOld | Out-Null; Send-Tg $cid 'UninstallOld done.'; continue }
-            if ($t -match '^/Reset\b')        { Run-PS $ScriptReset        | Out-N
+            if ($t -match '^/Reset\b')        { Run-PS $ScriptReset        | Out-Null; Send-Tg $cid "Reset done on $env:COMPUTERNAME"; continue }
+
+            Send-Tg $cid "Unknown: $t"
+        }
+    } catch { Start-Sleep 5 }
+}
